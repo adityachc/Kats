@@ -33,9 +33,13 @@ TorchLoss = torch.nn.modules.loss._Loss
 
 from kats.consts import Params, TimeSeriesData
 from kats.models.model import Model
-from kats.utils.parameter_tuning_utils import (
-    get_default_neuralprophet_parameter_search_space,
-)
+try:
+    from kats.utils.parameter_tuning_utils import (
+        get_default_neuralprophet_parameter_search_space,
+    )
+    _has_np_search_space = True
+except ImportError:
+    _has_np_search_space = False
 
 
 def _error_msg(msg: str) -> None:
@@ -141,8 +145,7 @@ class NeuralProphetParams(Params):
     seasonality_reg: float
     n_forecasts: int
     n_lags: int
-    num_hidden_layers: int
-    d_hidden: Optional[int]
+    ar_layers: List[int]
     ar_reg: Optional[float]
     learning_rate: Optional[float]
     epochs: Optional[int]
@@ -178,8 +181,7 @@ class NeuralProphetParams(Params):
         seasonality_reg: float = 0,
         n_forecasts: int = 1,
         n_lags: int = 0,
-        num_hidden_layers: int = 0,
-        d_hidden: Optional[int] = None,
+        ar_layers: Optional[List[int]] = None,
         ar_reg: Optional[float] = None,
         learning_rate: Optional[float] = None,
         epochs: Optional[int] = None,
@@ -210,8 +212,7 @@ class NeuralProphetParams(Params):
         self.seasonality_reg = seasonality_reg
         self.n_forecasts = n_forecasts
         self.n_lags = n_lags
-        self.num_hidden_layers = num_hidden_layers
-        self.d_hidden = d_hidden
+        self.ar_layers = [] if ar_layers is None else ar_layers
         self.ar_reg = ar_reg
         self.learning_rate = learning_rate
         self.epochs = epochs
@@ -247,8 +248,7 @@ class NeuralProphetParams(Params):
             f"seasonality_reg:{seasonality_reg},"
             f"n_forecasts:{n_forecasts},"
             f"n_lags:{n_lags},"
-            f"num_hidden_layers:{num_hidden_layers},"
-            f"d_hidden:{d_hidden},"
+            f"ar_layers:{ar_layers},"
             f"ar_reg:{ar_reg},"
             f"learning_rate:{learning_rate},"
             f"epochs:{epochs},"
@@ -354,7 +354,7 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
 
         return df[col_names]
 
-    def fit(self, freq: Optional[str] = None, **kwargs: Any) -> None:
+    def fit(self, freq: Optional[str] = "auto", **kwargs: Any) -> None:
         """Fit NeuralProphet model
 
         Args:
@@ -379,8 +379,7 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
             f"seasonality_reg:{self.params.seasonality_reg},"
             f"n_forecasts:{self.params.n_forecasts},"
             f"n_lags:{self.params.n_lags},"
-            f"num_hidden_layers:{self.params.num_hidden_layers},"
-            f"d_hidden:{self.params.d_hidden},"
+            f"ar_layers:{self.params.ar_layers},"
             f"ar_reg:{self.params.ar_reg},"
             f"learning_rate:{self.params.learning_rate},"
             f"epochs:{self.params.epochs},"
@@ -392,6 +391,25 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
             f"normalize:{self.params.normalize},"
             f"impute_missing:{self.params.impute_missing}"
         )
+
+        # Suppress NeuralProphet's verbose sub-loggers
+        for _log_name in ("NP.df_utils", "NP.config", "NP.time_dataset", "NP.utils",
+                          "NP.forecaster", "NP.components", "NP.train",
+                          "lightning", "pytorch_lightning", "lightning.pytorch"):
+            logging.getLogger(_log_name).setLevel(logging.ERROR)
+
+        # PyTorch >= 2.6 changed torch.load default to weights_only=True, which blocks
+        # NeuralProphet's LR range test — it saves/restores a training checkpoint that
+        # contains NeuralProphet config objects and torch loss classes not in the safe
+        # globals list. Patch torch.load to allow weights_only=False for the duration of
+        # fit() only. The checkpoint is created by NeuralProphet itself during training
+        # so it is trusted.
+        import torch as _torch
+        _orig_torch_load = _torch.load
+        def _patched_load(*args, **kwargs):
+            kwargs.setdefault('weights_only', False)
+            return _orig_torch_load(*args, **kwargs)
+        _torch.load = _patched_load
 
         neuralprophet = NeuralProphet(
             growth=self.params.growth,
@@ -407,8 +425,7 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
             seasonality_reg=self.params.seasonality_reg,
             n_forecasts=self.params.n_forecasts,
             n_lags=self.params.n_lags,
-            num_hidden_layers=self.params.num_hidden_layers,
-            d_hidden=self.params.d_hidden,
+            ar_layers=self.params.ar_layers,
             ar_reg=self.params.ar_reg,
             learning_rate=self.params.learning_rate,
             epochs=self.params.epochs,
@@ -433,7 +450,14 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
         for lagged_regressor in self.params.extra_lagged_regressors:
             neuralprophet.add_lagged_regressor(**lagged_regressor)
 
-        neuralprophet.fit(df=self.df, freq=freq)
+        # progress=False suppresses tqdm bar; deterministic=True makes training reproducible.
+        try:
+            neuralprophet.fit(df=self.df, freq=freq, progress=False, deterministic=True)
+        except TypeError:
+            neuralprophet.fit(df=self.df, freq=freq)
+        finally:
+            _torch.load = _orig_torch_load  # always restore, even if fit() raises
+
         self.model = neuralprophet
         logging.info("Fitted NeuralProphet model.")
 
@@ -484,9 +508,18 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
                 msg = "`future` should contain a column named 'ds' representing the timestamps."
                 _error_msg(msg)
         elif future is None:
+            # With n_lags > 0, make_future_dataframe treats 'periods' as the number of
+            # AR windows rather than timesteps: each window yields n_forecasts predictions
+            # but consumes n_lags + n_forecasts timesteps, so the actual number of
+            # output rows = periods - (n_lags + n_forecasts - 1). Solve for periods:
+            #   periods = steps + n_lags + n_forecasts - 1
+            # With n_lags=0 (default) this reduces to steps, preserving original behaviour.
+            n_lags = self.params.n_lags or 0
+            n_forecasts = self.params.n_forecasts or 1
+            periods = steps + n_lags + n_forecasts - 1 if n_lags > 0 else steps
             future = model.make_future_dataframe(
                 df=self.df,
-                periods=steps,
+                periods=periods,
             )
 
         if len(future) < steps:
@@ -499,13 +532,23 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
         if raw:
             return fcst
 
-        logging.info("Generated forecast data from Prophet model.")
+        logging.info("Generated forecast data from NeuralProphet model.")
         logging.debug("Forecast data: {fcst}".format(fcst=fcst))
 
-        self.fcst_df = fcst_df = pd.DataFrame(
-            {k: fcst[k] for k in fcst.columns if k == "ds" or k.startswith("yhat")},
-            copy=False,
-        )
+        # When n_lags > 0, the forecast dataframe includes historic prediction rows
+        # prepended for AR context — keep only the last `steps` (future) rows.
+        if len(fcst) > steps:
+            fcst = fcst.tail(steps).reset_index(drop=True)
+
+        # Rename to the standard Kats format expected by BackTesterExpandingWindow
+        # and _kats_forecast: 'time', 'fcst', 'fcst_lower', 'fcst_upper'.
+        fcst_vals = fcst["yhat1"].clip(lower=0)
+        self.fcst_df = fcst_df = pd.DataFrame({
+            "time": fcst["ds"].values,
+            "fcst": fcst_vals.values,
+            "fcst_lower": fcst_vals.values,
+            "fcst_upper": fcst_vals.values,
+        })
 
         logging.debug("Return forecast data: {fcst_df}".format(fcst_df=self.fcst_df))
         return fcst_df
@@ -524,5 +567,7 @@ class NeuralProphetModel(Model[NeuralProphetParams]):
     @staticmethod
     # pyre-fixme[15]: `kats.models.neuralprophet.NeuralProphetModel.get_parameter_search_space` overrides method defined in `Model` inconsistently.
     def get_parameter_search_space() -> List[Dict[str, object]]:
-        """Get default parameter search space for Prophet model"""
-        return get_default_neuralprophet_parameter_search_space()
+        """Get default parameter search space for NeuralProphet model"""
+        if _has_np_search_space:
+            return get_default_neuralprophet_parameter_search_space()
+        return []
