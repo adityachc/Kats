@@ -128,16 +128,37 @@ class HoltWintersModel(Model[HoltWintersParams]):
         """Fit the model with the specified input parameters"""
 
         logging.debug("Call fit() with parameters:{kwargs}".format(kwargs=kwargs))
-        # pyre-fixme[28]: Unexpected keyword argument `damped`.
-        holtwinters = HoltWinters(
-            # pyre-fixme[16]: `Optional` has no attribute `value`.
-            self.data.value,
-            trend=self.params.trend,
-            # pyrefly: ignore [unexpected-keyword]
-            damped=self.params.damped,
-            seasonal=self.params.seasonal,
-            seasonal_periods=self.params.seasonal_periods,
-        )
+        sp = self.params.seasonal_periods or 1
+        n = len(self.data.value)
+        # statsmodels requires 2 full seasonal cycles for heuristic/estimated initialization.
+        # When the series is too short, fall back to 'known' with flat zero seasonal components
+        # so HoltWinters can still compete in the backtester on shorter series.
+        if self.params.seasonal and sp > 1 and n < 2 * sp:
+            import numpy as np
+            vals = np.asarray(self.data.value, dtype=float)
+            holtwinters = HoltWinters(
+                self.data.value,
+                trend=self.params.trend,
+                # pyrefly: ignore [unexpected-keyword]
+                damped=self.params.damped,
+                seasonal=self.params.seasonal,
+                seasonal_periods=sp,
+                initialization_method="known",
+                initial_level=float(np.mean(vals[:min(n, sp)])),
+                initial_trend=0.0,
+                initial_seasonal=np.zeros(sp),
+            )
+        else:
+            # pyre-fixme[28]: Unexpected keyword argument `damped`.
+            holtwinters = HoltWinters(
+                # pyre-fixme[16]: `Optional` has no attribute `value`.
+                self.data.value,
+                trend=self.params.trend,
+                # pyrefly: ignore [unexpected-keyword]
+                damped=self.params.damped,
+                seasonal=self.params.seasonal,
+                seasonal_periods=self.params.seasonal_periods,
+            )
         self.model = holtwinters.fit()
         logging.info("Fitted HoltWinters.")
 
