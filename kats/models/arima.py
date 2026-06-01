@@ -267,9 +267,9 @@ class ARIMAModel(Model[ARIMAParams]):
         ).summary_frame()
         logging.info("Generated forecast data from arima model.")
 
-        self.y_fcst = fcst["mean"].ravel()
-        lower = fcst["mean_ci_lower"].ravel()
-        upper = fcst["mean_ci_upper"].ravel()
+        self.y_fcst = fcst["mean"].to_numpy()
+        lower = fcst["mean_ci_lower"].to_numpy()
+        upper = fcst["mean_ci_upper"].to_numpy()
         self.y_fcst_lower = lower
         self.y_fcst_upper = upper
 

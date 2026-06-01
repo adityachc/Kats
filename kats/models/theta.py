@@ -139,7 +139,7 @@ class ThetaModel(Model[ThetaParams]):
         self.ses_model = ses_model = SimpleExpSmoothing(deseas_data.value).fit()
         # creating x and intercept variables to fit a straight line
         regr = np.vstack([np.arange(self.n), np.ones(self.n)]).T
-        slope, _ = np.linalg.lstsq(regr, deseas_data.value.values)[0]
+        slope, _ = np.linalg.lstsq(regr, deseas_data.value.values, rcond=None)[0]
         self.drift = slope / 2
 
         if self.seasonal:
