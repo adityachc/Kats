@@ -35,12 +35,8 @@ from kats.models.prophet import predict
 from prophet import Prophet
 from prophet.make_holidays import make_holidays_df
 from prophet.serialize import model_from_json, model_to_json
-from pyre_extensions import ParameterSpecification
-
 # pyrefly: ignore [missing-module-attribute]
 from scipy.stats import norm
-
-P = ParameterSpecification("P")
 PROPHET_TIME_COLUMN = "ds"
 PROPHET_VALUE_COLUMN = "y"
 PROPHET_YHAT_COLUMN = "yhat"
